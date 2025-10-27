@@ -4,6 +4,11 @@
 // - Emits bytecode, encodes payload (XOR + base64)
 // - Emits a Luau-compatible interpreter (visible) that executes bytecode
 // - Adds junk to reach target size
+//
+// Usage:
+// const { obfuscateLua } = require('./obfuscator');
+// const out = obfuscateLua('print("hello")', { targetSizeBytes: 100*1024 });
+// fs.writeFileSync('obf.lua', out, 'utf8');
 
 const crypto = require('crypto');
 
@@ -30,7 +35,8 @@ function xorBuffer(buf, key){
 ///// Tokenizer (very small)
 function tokenize(src){
   const tokens = [];
-  const re = /\s*([A-Za-z_][A-Za-z0-9_]*|\d+\.\d+|\d+|==|~=|<=|>=|\.{2}|.|\n)\s*/g;
+  // This tokenizer is intentionally simple — it handles identifiers, numbers, quoted strings, operators, and keywords reasonably for the POC.
+  const re = /\s*([A-Za-z_][A-Za-z0-9_]*|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\d+\.\d+|\d+|==|~=|<=|>=|\.{2}|.|\n)\s*/g;
   let m;
   while ((m = re.exec(src)) !== null){
     tokens.push(m[1]);
@@ -69,12 +75,10 @@ Parser.prototype.parseStatement = function(){
       const expr = this.parseExpression();
       return { type:'local_assign', name, expr };
     } else {
-      // local declaration without init
       return { type:'local_decl', name };
     }
   }
   if (p === 'function'){
-    // function name (simple) or global?
     this.next();
     const name = this.next();
     this.eat('(');
@@ -97,8 +101,19 @@ Parser.prototype.parseStatement = function(){
     const expr = this.parseExpression();
     return { type:'return', expr };
   }
+  if (p === 'while'){
+    // while <expr> do <body> end
+    this.next();
+    const cond = this.parseExpression();
+    this.eat('do');
+    const body = [];
+    while (this.peek() !== 'end' && this.peek() !== undefined){
+      body.push(this.parseStatement());
+    }
+    this.eat('end');
+    return { type:'while', cond, body };
+  }
   // assignment or function call
-  // simple pattern: id = expr  OR id ( ... )
   if (/^[A-Za-z_]/.test(p)){
     const id = this.next();
     if (this.peek() === '='){
@@ -106,7 +121,6 @@ Parser.prototype.parseStatement = function(){
       const expr = this.parseExpression();
       return { type:'assign', name:id, expr };
     } else if (this.peek() === '('){
-      // function call
       this.eat('(');
       const args = [];
       while (this.peek() !== ')' && this.peek() !== undefined){
@@ -116,7 +130,6 @@ Parser.prototype.parseStatement = function(){
       this.eat(')');
       return { type:'call', callee:id, args };
     } else {
-      // bare expression / unsupported -> treat as noop
       return { type:'noop' };
     }
   }
@@ -129,7 +142,6 @@ Parser.prototype.parseExpression = function(){
   return this.parseConcat();
 };
 
-// support .. (concat) with lower precedence
 Parser.prototype.parseConcat = function(){
   let left = this.parseAdd();
   while (this.peek() === '..'){
@@ -166,14 +178,9 @@ Parser.prototype.parsePrimary = function(){
   if (/^\d/.test(p)){
     this.next(); return { type:'number', value: Number(p) };
   }
-  if (p === '"' || p==='\''){
-    // shouldn't happen due to tokenizer; but fallback
+  if ((p[0] === '"' && p[p.length-1] === '"') || (p[0] === "'" && p[p.length-1] === "'")){
+    this.next(); const str = p.slice(1, -1).replace(/\\n/g, '\n').replace(/\\r/g, '\r'); return { type:'string', value: str };
   }
-  // strings: tokens may include the full quoted string if tokenizer kept quotes; we used regex that produces single chars, so we find strings by scanning original source separately.
-  if (/^".*"$/.test(p) || /^'.*'$/.test(p)){
-    this.next(); return { type:'string', value: p.slice(1,-1) };
-  }
-  // identifier or function call as expression
   if (/^[A-Za-z_]/.test(p)){
     const id = this.next();
     if (this.peek() === '('){
@@ -208,6 +215,8 @@ const OPCODES = {
   MUL: 10,
   DIV: 11,
   CONCAT: 12,
+  JMP: 13,
+  JZ: 14,
   CLOSE: 255
 };
 
@@ -215,11 +224,12 @@ function BytecodeBuilder(){
   this.consts = []; // array of constants
   this.names = [];  // global names
   this.code = [];   // number array: [op, arg1, arg2 ...]
-  this.localSlots = {}; // map function-scope locals to slot index (only 0..N)
+  this.localSlots = {}; // map function-scope locals to slot index
+  this.nextLocalSlot = 0;
 }
 BytecodeBuilder.prototype.addConst = function(v){
-  const key = (typeof v) + '::' + String(v);
-  const idx = this.consts.indexOf(v);
+  // naive add (allow duplicates for simplicity)
+  const idx = this.consts.findIndex(x => x === v);
   if (idx !== -1) return idx;
   this.consts.push(v);
   return this.consts.length - 1;
@@ -233,50 +243,47 @@ BytecodeBuilder.prototype.addName = function(n){
 BytecodeBuilder.prototype.emit = function(){
   for (let i=0;i<arguments.length;i++) this.code.push(arguments[i]);
 };
+BytecodeBuilder.prototype.newLocal = function(name){
+  if (this.localSlots[name] !== undefined) return this.localSlots[name];
+  const slot = this.nextLocalSlot++;
+  this.localSlots[name] = slot;
+  return slot;
+};
 BytecodeBuilder.prototype.buildFromAst = function(ast){
+  if (!ast) return;
   if (ast.type === 'chunk'){
     for (const s of ast.body) this.buildFromAst(s);
     this.emit(OPCODES.CLOSE);
     return;
   }
   if (ast.type === 'local_assign'){
-    // local name = expr
-    const slot = Object.keys(this.localSlots).length;
-    this.localSlots[ast.name] = slot;
+    const slot = this.newLocal(ast.name);
     this.buildExpr(ast.expr);
     this.emit(OPCODES.SETL, slot);
     return;
   }
   if (ast.type === 'assign'){
-    // name = expr (global)
     this.buildExpr(ast.expr);
     const idx = this.addName(ast.name);
     this.emit(OPCODES.SETG, idx);
     return;
   }
   if (ast.type === 'call'){
-    // push global function
     const idx = this.addName(ast.callee);
     this.emit(OPCODES.GETG, idx);
-    for (const a of ast.args){
-      this.buildExpr(a);
-    }
+    for (const a of ast.args) this.buildExpr(a);
     this.emit(OPCODES.CALL, ast.args.length);
-    // pop result implicitly
     return;
   }
   if (ast.type === 'function'){
-    // For POC: we support top-level function definitions by storing function as a constant
-    // Build a child builder for body
+    // build nested function as a constant that contains its own builder serialization
     const child = new BytecodeBuilder();
-    // map params to local slots
-    for (let i=0;i<ast.params.length;i++){
-      child.localSlots[ast.params[i]] = i; // params occupy first slots
-    }
+    // params occupy local slots 0..n-1
+    for (let i=0;i<ast.params.length;i++) child.localSlots[ast.params[i]] = i;
+    child.nextLocalSlot = ast.params.length;
     for (const s of ast.body) child.buildFromAst(s);
     child.emit(OPCODES.RETURN, 0);
     child.emit(OPCODES.CLOSE);
-    // make a serialized function object: {consts, names, code, locals}
     const fnObj = { consts: child.consts, names: child.names, code: child.code };
     const cidx = this.addConst(fnObj);
     const nameIdx = this.addName(ast.name);
@@ -287,6 +294,21 @@ BytecodeBuilder.prototype.buildFromAst = function(ast){
   if (ast.type === 'return'){
     this.buildExpr(ast.expr);
     this.emit(OPCODES.RETURN, 1);
+    return;
+  }
+  if (ast.type === 'while'){
+    // compile: start -> cond ; JZ end ; body ; JMP start ; end:
+    const startPos = this.code.length;
+    this.buildExpr(ast.cond);
+    // placeholder for JZ (patch later)
+    this.emit(OPCODES.JZ, 0);
+    const jzPos = this.code.length - 1;
+    for (const s of ast.body) this.buildFromAst(s);
+    this.emit(OPCODES.JMP, startPos);
+    const endPos = this.code.length;
+    // patch JZ target to endPos
+    this.code[jzPos] = OPCODES.JZ;
+    this.code[jzPos + 1] = endPos;
     return;
   }
   if (ast.type === 'noop') return;
@@ -304,7 +326,6 @@ BytecodeBuilder.prototype.buildExpr = function(expr){
     this.emit(OPCODES.PUSHK, idx); return;
   }
   if (expr.type === 'ident'){
-    // global or local?
     if (expr.name in this.localSlots){
       this.emit(OPCODES.GETL, this.localSlots[expr.name]); return;
     } else {
@@ -313,7 +334,6 @@ BytecodeBuilder.prototype.buildExpr = function(expr){
     }
   }
   if (expr.type === 'call_expr'){
-    // push function value
     if (expr.callee in this.localSlots){
       this.emit(OPCODES.GETL, this.localSlots[expr.callee]);
     } else {
@@ -334,40 +354,33 @@ BytecodeBuilder.prototype.buildExpr = function(expr){
     else this.emit(OPCODES.ADD);
     return;
   }
-  // default nil
   this.emit(OPCODES.PUSHK, this.addConst(null));
 };
 
-///// Serializer: create a compact binary representation
-function serializeProgram(builder){
-  // Simple JSON-like serialization, then to buffer
-  const obj = { consts: builder.consts, names: builder.names, code: builder.code };
-  const s = JSON.stringify(obj);
-  return Buffer.from(s, 'utf8');
+///// Serializer: produce a Lua table literal so loader can load it via load("return "..text)
+function serializeToLuaTable(builder){
+  function litVal(v){
+    if (v === null || v === undefined) return 'nil';
+    if (typeof v === 'number') return String(v);
+    if (typeof v === 'string') {
+      return '"' + v.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n') + '"';
+    }
+    if (typeof v === 'object') {
+      if (v.consts && v.names && v.code){
+        return '{ consts = {' + v.consts.map(litVal).join(',') + '}, names = {' + v.names.map(s=> '"' + String(s).replace(/"/g,'\\"') + '"' ).join(',') + '}, code = {' + v.code.join(',') + '} }';
+      }
+      return 'nil';
+    }
+    return 'nil';
+  }
+  const constsPart = builder.consts.map(litVal).join(',');
+  const namesPart = builder.names.map(s=> '"' + String(s).replace(/"/g,'\\"') + '"' ).join(',');
+  const codePart = builder.code.join(',');
+  return '{ consts = {' + constsPart + '}, names = {' + namesPart + '}, code = {' + codePart + '} }';
 }
 
-///// Build Lua loader (interpreter) code (Luau-compatible)
+///// Build Lua loader (interpreter) code (executor-friendly; uses load)
 function buildLuaInterpreterPayload(base64Payload, xorKey){
-  // We'll embed a small interpreter in Lua that:
-  // - base64-decodes the payload
-  // - XOR-decrypts bytes
-  // - parses JSON using a tiny local parser (we'll keep serialized payload simple so we can use load on a Lua literal)
-  // For safety (no loadstring used), we will decode JSON-ish string and use a tiny JSON parse in Lua.
-  // To keep POC short, we'll pass payload as a base64-encoded JSON string, then in Lua do a small decode + "load" into a table via safe deserialization.
-  // Note: implementing a full JSON parser in Lua is long; instead we will produce a Lua table literal at serialization time (not JSON).
-  // So change: serializeProgram will produce a Lua table text rather than JSON — easier to load via load (but not loadstring required? interpreter will parse the table via an internal parser).
-  // To simplify: we will embed the decoded string and then run 'load' on 'return ' .. decoded to get a table (this uses load and is allowed in executors; in Studio some load usage is restricted — but VM obfuscator is primarily for executor mode; if Studio compatibility is needed, we can implement a small parser.)
-
-  // For executor mode we can use load to create the table. We'll use load (exists in many executors).
-  // Build bootstrap that decodes and 'load's the table, then interprets bytecode.
-
-  // The Lua loader below will:
-  // - have base64 decoder (internal)
-  // - decode payload to text
-  // - XOR with key
-  // - load('return '..text) to reconstruct table {consts=..., names=..., code=...}
-  // - run VM interpreter over the code
-
   const lua = `
 -- VM loader generated
 local payload_b64 = "${base64Payload}"
@@ -394,20 +407,20 @@ end
 local enc = b64dec(payload_b64)
 local bytes = {}
 for i=1,#enc do bytes[i] = string.byte(enc,i) ~ xor_key end
-local txt = string.char(unpack(bytes))
--- 'txt' now contains Lua source for a table literal; we will load it via load (executor-only)
+local parts = {}
+for i=1,#bytes do parts[i] = string.char(bytes[i]) end
+local txt = table.concat(parts)
+
 local loader = load("return "..txt)
 if not loader then error("vm: failed to load payload") end
 local prog = loader()
--- prog = { consts = {...}, names = {...}, code = {...} }
 
--- interpreter
-local OP = { PUSHK=1, GETG=2, SETG=3, GETL=4, SETL=5, CALL=6, RETURN=7, ADD=8, SUB=9, MUL=10, DIV=11, CONCAT=12, CLOSE=255 }
+local OP = { PUSHK=1, GETG=2, SETG=3, GETL=4, SETL=5, CALL=6, RETURN=7, ADD=8, SUB=9, MUL=10, DIV=11, CONCAT=12, JMP=13, JZ=14, CLOSE=255 }
 
 local function run(prog)
-  local consts = prog.consts
-  local names = prog.names
-  local code = prog.code
+  local consts = prog.consts or {}
+  local names = prog.names or {}
+  local code = prog.code or {}
   local ip = 1
   local stack = {}
   local locals = {}
@@ -438,12 +451,8 @@ local function run(prog)
       for i=1,nargs do args[nargs-i+1] = pop() end
       local fn = pop()
       if type(fn) == 'function' then
-        local ok,res = pcall(fn, table.unpack(args))
-        if ok then
-          push(res)
-        else
-          push(nil)
-        end
+        local ok, res = pcall(fn, table.unpack(args))
+        if ok then push(res) else push(nil) end
       else
         push(nil)
       end
@@ -457,6 +466,8 @@ local function run(prog)
     elseif op == OP.MUL then local b=pop(); local a=pop(); push(a * b)
     elseif op == OP.DIV then local b=pop(); local a=pop(); push(a / b)
     elseif op == OP.CONCAT then local b=pop(); local a=pop(); push(tostring(a)..tostring(b))
+    elseif op == OP.JMP then local target = code[ip]; ip = target + 1
+    elseif op == OP.JZ then local target = code[ip]; ip = ip + 1; local v = pop(); if not v then ip = target + 1 end
     elseif op == OP.CLOSE then break
     else
       error("vm: unknown opcode "..tostring(op))
@@ -464,10 +475,8 @@ local function run(prog)
   end
 end
 
--- run
 run(prog)
 `;
-
   return lua;
 }
 
@@ -486,28 +495,7 @@ function obfuscateLua(source, opts = {}){
   builder.buildFromAst(ast);
 
   // serialize program to a Lua table literal string
-  // We'll produce a Lua table literal like: { consts = {...}, names = {...}, code = {...} }
-  const tableLit = (() => {
-    function litVal(v){
-      if (v === null || v === undefined) return 'nil';
-      if (typeof v === 'number') return String(v);
-      if (typeof v === 'string') {
-        return '"' + v.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n') + '"';
-      }
-      if (typeof v === 'object') {
-        // function object for nested functions (child bytecode)
-        // recursively emit nested table
-        if (v.consts && v.names && v.code){
-          return '{ consts = {' + v.consts.map(litVal).join(',') + '}, names = {' + v.names.map(litVal).join(',') + '}, code = {' + v.code.join(',') + '} }';
-        }
-      }
-      return 'nil';
-    }
-    const constsPart = builder.consts.map(litVal).join(',');
-    const namesPart = builder.names.map(s=> '"' + String(s).replace(/"/g,'\\"') + '"' ).join(',');
-    const codePart = builder.code.join(',');
-    return '{ consts = {' + constsPart + '}, names = {' + namesPart + '}, code = {' + codePart + '} }';
-  })();
+  const tableLit = serializeToLuaTable(builder);
 
   // XOR + base64 encode the table literal text
   const payloadBuf = Buffer.from(tableLit, 'utf8');
