@@ -1,12 +1,14 @@
 // obfuscator.js
-// Robust Luau-friendly obfuscator with heavy junk/noise and parser-safe output.
-// - Encodes strings with single-byte XOR then base64
-// - Decoder prefers bit32.bxor but falls back to pure-Lua XOR implementation if needed
-// - Conservative identifier renaming
-// - Junk injection: many noop functions and huge unused strings (configurable)
-// - Wraps user code in `do ... end` to prevent ambiguous leading tokens
+// Heavy obfuscator for Luau (Roblox friendly). Produces ~TARGET_SIZE_BYTES output
+// with complicated-looking (but inert) functions, closures, wrappers, and large unused strings.
+// - XOR+base64 string encoding with bit32 fallback
+// - Conservative renaming
+// - Wraps user code in do...end
+// - Configurable target size (default 100KB)
 
 const crypto = require('crypto');
+
+const DEFAULT_TARGET_SIZE = 100 * 1024; // 100 KB
 
 function randId(len = 8) {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
@@ -14,21 +16,23 @@ function randId(len = 8) {
   for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
   return '_' + s;
 }
-
 function randint(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// Strip comments (long bracket and single-line)
+const LUA_KEYWORDS = new Set([
+  "and","break","do","else","elseif","end","false","for","function","goto","if",
+  "in","local","nil","not","or","repeat","return","then","true","until","while"
+]);
+
+// Basic utilities
 function stripComments(code) {
-  code = code.replace(/--\[(=*)\[(?:[\s\S]*?)\]\1\]/g, ''); // --[[ ... ]]
-  code = code.replace(/--[^\n\r]*/g, ''); // -- single-line
+  code = code.replace(/--\[(=*)\[(?:[\s\S]*?)\]\1\]/g, '');
+  code = code.replace(/--[^\n\r]*/g, '');
   return code;
 }
 
-// Extract string literals
 const STRING_RE = /(['"])(?:\\.|(?!\1).)*?\1/g;
-
 function extractStrings(code) {
   const strings = [];
   const replaced = code.replace(STRING_RE, (m) => {
@@ -46,12 +50,6 @@ function encodeStringLiteral(inner) {
   return { key, b64: out.toString('base64') };
 }
 
-const LUA_KEYWORDS = new Set([
-  "and","break","do","else","elseif","end","false","for","function","goto","if",
-  "in","local","nil","not","or","repeat","return","then","true","until","while"
-]);
-
-// conservative identifier find (ignores strings)
 function findIdentifiers(code) {
   const tmp = code.replace(STRING_RE, ' ');
   const ids = new Set();
@@ -64,18 +62,16 @@ function findIdentifiers(code) {
   return Array.from(ids);
 }
 
-// build Luau-compatible decoder using bit32.bxor with a fallback
+// Decoder (bit32 with fallback)
 function buildDecoderLua(encList) {
   const b64Array = encList.map(e => `"${e.b64.replace(/"/g, '\\"')}"`).join(', ');
   const keyArray  = encList.map(e => `${e.key}`).join(', ');
 
-  // Provide fallback XOR if bit32 not available
   const decoder = `
--- runtime decoder injected by obfuscator (Luau-friendly)
+-- runtime decoder (Luau-friendly) injected by obfuscator
 local __S = { ${b64Array} }
 local __K = { ${keyArray} }
 
--- base64 decoder (minimal)
 local function __b64decode(s)
   local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
   s = string.gsub(s, '[^'..b..'=]', '')
@@ -91,9 +87,7 @@ local function __b64decode(s)
   end))
 end
 
--- fallback xor for environments lacking bit32
 local function __bxor_fallback(a, b)
-  -- a and b are 0..255
   local res = 0
   for i = 0,7 do
     local abit = math.floor(a / (2^i)) % 2
@@ -131,69 +125,110 @@ end
   return decoder;
 }
 
-// Generate junk/noop code: many functions and huge unused strings
-function generateJunk(countFuncs = 40, largeStrings = 3, stringSize = 20000) {
-  let out = '\n-- junk section (noop functions and large unused strings)\n';
-  for (let i = 0; i < countFuncs; i++) {
-    const name = randId(10);
-    const a = randId(6), b = randId(6), c = randId(6);
-    // produce slightly different noop bodies to avoid trivial dedupe
-    out += `local function ${name}(${a}, ${b}, ${c})\n  local _x = ${a} or ${b}\n  local _y = ${b} or ${c}\n  if _x == _y then return _x end\n  return (_y or _x)\nend\n\n`;
+// Create "complex" junk: nested closures, upvalue usage, table indirection, wrapper chain,
+// opaque predicates, and large concatenated strings. Keep them unused but referenced enough to avoid trivial pruning.
+function generateComplexJunk(targetBytes, opts = {}) {
+  // Build junk until approximate size >= targetBytes
+  let out = '\n-- BEGIN COMPLEX JUNK SECTION\n';
+  let approx = out.length;
+
+  // helper to append and update approx
+  function append(s) { out += s; approx += s.length; }
+
+  // Add layered wrapper functions and closures
+  const wrapperCount = opts.wrapperCount ?? 12;
+  for (let i = 0; i < wrapperCount && approx < targetBytes * 0.4; i++) {
+    const wname = randId(10);
+    const inner = randId(8);
+    const param = randId(6);
+    const up = randId(6);
+    append(`local function ${wname}(${param})\n  local ${up} = ${param}\n  local function ${inner}()\n    -- pretend to capture upvalue\n    local _a = ${up}\n    if _a == nil then return _a end\n    return _a\n  end\n  return ${inner}\nend\n\n`);
   }
-  for (let j = 0; j < largeStrings; j++) {
-    const varName = randId(10);
-    const chunks = [];
-    // create many small base64-derived chunks and concat them so it looks random but is safe
-    const chunkCount = Math.max(1, Math.floor(stringSize / 64));
-    for (let k = 0; k < chunkCount; k++) {
-      const chunk = crypto.randomBytes(48).toString('base64').replace(/[=+/]/g,'A').slice(0,64);
-      chunks.push(`"${chunk}"`);
+
+  // Add opaque predicates & conditional chains
+  const opaqueCount = opts.opaqueCount ?? 20;
+  for (let i = 0; i < opaqueCount && approx < targetBytes * 0.55; i++) {
+    const a = randint(100000, 999999);
+    const b = a + 1;
+    const name = randId(8);
+    append(`local function ${name}()\n  local _x = ${a}\n  local _y = ${b}\n  if (_x + 1) == (_y) then\n    return true\n  else\n    return false\n  end\nend\n\n`);
+  }
+
+  // Add table indirection and metamethod-like structures (harmless)
+  const tableCount = opts.tableCount ?? 6;
+  for (let t = 0; t < tableCount && approx < targetBytes * 0.75; t++) {
+    const tname = randId(9);
+    const tn2 = randId(7);
+    append(`local ${tname} = {}\nfor i=1,${randint(3,14)} do ${tname}[i] = "${crypto.randomBytes(8).toString('hex')}" end\nlocal ${tn2} = function() return ${tname} end\nlocal _ref_${t} = ${tn2}()\n\n`);
+  }
+
+  // Add many nested no-op functions with slightly randomized bodies to defeat dedup
+  const noopCount = opts.noopCount ?? 40;
+  for (let n = 0; n < noopCount && approx < targetBytes * 0.85; n++) {
+    const fname = randId(10);
+    const p1 = randId(6), p2 = randId(6), p3 = randId(6);
+    append(`local function ${fname}(${p1}, ${p2}, ${p3})\n  local _v = (${p1} or ${p2})\n  for i=1,${randint(1,5)} do _v = _v end\n  return function() return _v end\nend\n\n`);
+  }
+
+  // Add large concatenated strings to pad to target
+  // We'll append many medium-sized chunks so final size is adjustable
+  function addLargeStrings(neededBytes) {
+    let added = 0;
+    let idx = 0;
+    while (approx + added < neededBytes) {
+      const varName = randId(9) + idx;
+      const chunkCount = 32; // 32 * ~48 -> ~1536 bytes per var
+      const chunks = [];
+      for (let k = 0; k < chunkCount; k++) {
+        // base64 chunk sanitized
+        const chunk = crypto.randomBytes(36).toString('base64').replace(/[=+/]/g, 'A').slice(0,48);
+        chunks.push(`"${chunk}"`);
+      }
+      const s = `local ${varName} = ${chunks.join(' .. ')}\nlocal _unused_len_${idx} = #${varName}\n\n`;
+      append(s);
+      added += s.length;
+      idx += 1;
+      // safety break to avoid infinite loop
+      if (idx > 400) break;
     }
-    out += `local ${varName} = ${chunks.join(' .. ')}\n`;
-    out += `local _unused_${j} = #${varName}\n\n`;
+    return;
   }
-  out += '-- end junk\n\n';
+
+  // final padding to target
+  addLargeStrings(targetBytes * 1.05); // overshoot slightly to ensure size
+
+  append('-- END COMPLEX JUNK SECTION\n\n');
   return out;
 }
 
-// ensure safe separator between sections to avoid ambiguous tokens
-function safeSeparator() {
-  // a Lua semicolon is a statement separator — include it inside a comment so it is harmless
-  return '\n-- ;; separator\n';
-}
+// safe separator to avoid ambiguous tokens
+function safeSeparator() { return '\n-- ;; separator\n'; }
 
-// main obfuscator
-function obfuscateLua(code, opts = {}) {
-  const junkFuncs = opts.junkFunctions ?? 80;
-  const largeStrings = opts.largeStrings ?? 6;
-  const stringSize = opts.stringSize ?? 60000;
+// Main obfuscate function
+function obfuscateLua(inputCode, options = {}) {
+  const TARGET_SIZE_BYTES = options.targetSizeBytes ?? DEFAULT_TARGET_SIZE;
 
   // 1) strip comments
-  let c = stripComments(code);
+  let code = stripComments(inputCode);
 
-  // 2) extract string literals
-  const { replaced, strings } = extractStrings(c);
-
-  // 3) encode strings
+  // 2) extract and encode strings
+  const { replaced, strings } = extractStrings(code);
   const encoders = [];
   for (let i = 0; i < strings.length; i++) {
-    const raw = strings[i]; // includes quotes
+    const raw = strings[i];
     let inner = raw.slice(1, -1);
-    // handle common escapes conservatively
     inner = inner.replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t')
                  .replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-    const enc = encodeStringLiteral(inner);
-    encoders.push(enc);
+    encoders.push(encodeStringLiteral(inner));
   }
 
-  // 4) replace placeholders with (__decode(i)) calls
+  // 3) replace placeholders with decoder calls (safe parentheses)
   let replacedCode = replaced;
   for (let i = 0; i < encoders.length; i++) {
-    // put explicit parentheses to keep expression nature, but we'll wrap whole code in do..end later
     replacedCode = replacedCode.replace(new RegExp(`__STR_PLACEHOLDER_${i}__`, 'g'), `(__decode(${i+1}))`);
   }
 
-  // 5) conservative renaming
+  // 4) conservative identifier rename
   const ids = findIdentifiers(replacedCode);
   ids.sort((a, b) => b.length - a.length);
   const skipRegex = /^(?:_G|io|os|math|string|table|coroutine|package|debug|bit32)$/;
@@ -210,21 +245,41 @@ function obfuscateLua(code, opts = {}) {
     renamed = renamed.replace(new RegExp(`\\b${oldId}\\b`, 'g'), newId);
   }
 
-  // 6) minify lightly
+  // 5) light minify
   renamed = renamed.replace(/[ \t]{2,}/g, ' ');
   renamed = renamed.replace(/\r\n/g, '\n');
   renamed = renamed.replace(/\n{2,}/g, '\n');
   renamed = renamed.split('\n').map(l => l.trim()).join('\n');
 
-  // 7) build decoder and junk and wrap in a do-end block to avoid ambiguous leading tokens
+  // 6) build decoder and complex junk until approximate target size reached
   const decoder = buildDecoderLua(encoders);
-  const junk = generateJunk(junkFuncs, largeStrings, stringSize);
+  let junk = generateComplexJunk(TARGET_SIZE_BYTES, {
+    wrapperCount: options.wrapperCount ?? 18,
+    opaqueCount: options.opaqueCount ?? 40,
+    tableCount: options.tableCount ?? 8,
+    noopCount: options.noopCount ?? 70
+  });
 
-  // use safe separators and wrap user code in a block
-  const final = decoder + safeSeparator() + junk + safeSeparator() + '\n-- user code block (wrapped)\n' +
-                'do\n' + renamed + '\nend\n';
+  // If junk isn't big enough, add more padding strings
+  // simple loop: while total < target add more large strings (this may overshoot a bit)
+  let assembled = decoder + safeSeparator() + junk + safeSeparator() + '-- user block wrapper\n' + 'do\n' + renamed + '\nend\n';
+  // enlarge until approx size reached
+  const MAX_ITER = 8;
+  let iter = 0;
+  while (Buffer.byteLength(assembled, 'utf8') < TARGET_SIZE_BYTES && iter < MAX_ITER) {
+    // add more large string padding
+    const pad = generateComplexJunk(Math.max(32 * 1024, TARGET_SIZE_BYTES - Buffer.byteLength(assembled, 'utf8')), {
+      wrapperCount: 2,
+      opaqueCount: 4,
+      tableCount: 1,
+      noopCount: 6
+    });
+    junk += pad;
+    assembled = decoder + safeSeparator() + junk + safeSeparator() + '-- user block wrapper\n' + 'do\n' + renamed + '\nend\n';
+    iter += 1;
+  }
 
-  return final;
+  return assembled;
 }
 
 module.exports = { obfuscateLua };
