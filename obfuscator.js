@@ -1,23 +1,11 @@
-// obfuscator.js
-// VM obfuscator proof-of-concept for Luau (Roblox).
-// - Small parser for a useful subset
-// - Emits bytecode, encodes payload (XOR + base64)
-// - Emits a Luau-compatible interpreter (visible) that executes bytecode
-// - Adds junk to reach target size
-//
-// Usage:
-// const { obfuscateLua } = require('./obfuscator');
-// const out = obfuscateLua('print("hello")', { targetSizeBytes: 100*1024 });
-// fs.writeFileSync('obf.lua', out, 'utf8');
-
+// obfuscator.js (fixed loader: portable XOR & safe load)
+// VM obfuscator POC for executor environments (uses load/loadstring).
 const crypto = require('crypto');
 
-///// Configurable constants
-const DEFAULT_TARGET = 100 * 1024; // 100 KB
+const DEFAULT_TARGET = 100 * 1024;
 const XOR_KEY_MIN = 1;
 const XOR_KEY_MAX = 255;
 
-///// Utilities
 function randName(len = 10) {
   const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
   let s = "";
@@ -32,10 +20,9 @@ function xorBuffer(buf, key){
   return out;
 }
 
-///// Tokenizer (very small)
+// simple tokenizer & parser (subset) - identical to prior POC
 function tokenize(src){
   const tokens = [];
-  // This tokenizer is intentionally simple — it handles identifiers, numbers, quoted strings, operators, and keywords reasonably for the POC.
   const re = /\s*([A-Za-z_][A-Za-z0-9_]*|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\d+\.\d+|\d+|==|~=|<=|>=|\.{2}|.|\n)\s*/g;
   let m;
   while ((m = re.exec(src)) !== null){
@@ -44,7 +31,7 @@ function tokenize(src){
   return tokens;
 }
 
-///// Parser (subset)
+// Parser constructor
 function Parser(tokens){
   this.toks = tokens;
   this.i = 0;
@@ -55,7 +42,7 @@ Parser.prototype.eat = function(tok){
   if (this.peek() === tok) { this.next(); return true; }
   return false;
 };
-
+// parseChunk / parseStatement / parseExpression (same subset as before)
 Parser.prototype.parseChunk = function(){
   const stmts = [];
   while (this.i < this.toks.length){
@@ -65,18 +52,15 @@ Parser.prototype.parseChunk = function(){
   }
   return { type: 'chunk', body: stmts };
 };
-
 Parser.prototype.parseStatement = function(){
   const p = this.peek();
   if (p === 'local'){
-    this.next(); // consume local
-    const name = this.next(); // identifier
+    this.next();
+    const name = this.next();
     if (this.eat('=')){
       const expr = this.parseExpression();
       return { type:'local_assign', name, expr };
-    } else {
-      return { type:'local_decl', name };
-    }
+    } else return { type:'local_decl', name };
   }
   if (p === 'function'){
     this.next();
@@ -90,9 +74,7 @@ Parser.prototype.parseStatement = function(){
     }
     this.eat(')');
     const body = [];
-    while (this.peek() !== 'end' && this.peek() !== undefined){
-      body.push(this.parseStatement());
-    }
+    while (this.peek() !== 'end' && this.peek() !== undefined) body.push(this.parseStatement());
     this.eat('end');
     return { type:'function', name, params, body };
   }
@@ -102,25 +84,18 @@ Parser.prototype.parseStatement = function(){
     return { type:'return', expr };
   }
   if (p === 'while'){
-    // while <expr> do <body> end
     this.next();
     const cond = this.parseExpression();
     this.eat('do');
     const body = [];
-    while (this.peek() !== 'end' && this.peek() !== undefined){
-      body.push(this.parseStatement());
-    }
+    while (this.peek() !== 'end' && this.peek() !== undefined) body.push(this.parseStatement());
     this.eat('end');
     return { type:'while', cond, body };
   }
-  // assignment or function call
   if (/^[A-Za-z_]/.test(p)){
     const id = this.next();
-    if (this.peek() === '='){
-      this.next();
-      const expr = this.parseExpression();
-      return { type:'assign', name:id, expr };
-    } else if (this.peek() === '('){
+    if (this.peek() === '='){ this.next(); const expr = this.parseExpression(); return { type:'assign', name:id, expr }; }
+    else if (this.peek() === '('){
       this.eat('(');
       const args = [];
       while (this.peek() !== ')' && this.peek() !== undefined){
@@ -129,242 +104,97 @@ Parser.prototype.parseStatement = function(){
       }
       this.eat(')');
       return { type:'call', callee:id, args };
-    } else {
-      return { type:'noop' };
-    }
+    } else return { type:'noop' };
   }
-  // skip token
   this.next();
   return { type:'noop' };
 };
-
-Parser.prototype.parseExpression = function(){
-  return this.parseConcat();
-};
-
+Parser.prototype.parseExpression = function(){ return this.parseConcat(); };
 Parser.prototype.parseConcat = function(){
   let left = this.parseAdd();
-  while (this.peek() === '..'){
-    this.next();
-    const right = this.parseAdd();
-    left = { type:'binop', op:'..', left, right };
-  }
+  while (this.peek() === '..'){ this.next(); const right = this.parseAdd(); left = { type:'binop', op:'..', left, right }; }
   return left;
 };
 Parser.prototype.parseAdd = function(){
   let left = this.parseMul();
-  while (this.peek() === '+' || this.peek() === '-'){
-    const op = this.next();
-    const right = this.parseMul();
-    left = { type:'binop', op, left, right };
-  }
+  while (this.peek() === '+' || this.peek() === '-'){ const op = this.next(); const right = this.parseMul(); left = { type:'binop', op, left, right }; }
   return left;
 };
 Parser.prototype.parseMul = function(){
   let left = this.parsePrimary();
-  while (this.peek() === '*' || this.peek() === '/'){
-    const op = this.next();
-    const right = this.parsePrimary();
-    left = { type:'binop', op, left, right };
-  }
+  while (this.peek() === '*' || this.peek() === '/'){ const op = this.next(); const right = this.parsePrimary(); left = { type:'binop', op, left, right }; }
   return left;
 };
 Parser.prototype.parsePrimary = function(){
-  const p = this.peek();
-  if (!p) return { type:'nil' };
-  if (p === '('){
-    this.next(); const e = this.parseExpression(); this.eat(')'); return e;
-  }
-  if (/^\d/.test(p)){
-    this.next(); return { type:'number', value: Number(p) };
-  }
+  const p = this.peek(); if (!p) return { type:'nil' };
+  if (p === '('){ this.next(); const e = this.parseExpression(); this.eat(')'); return e; }
+  if (/^\d/.test(p)){ this.next(); return { type:'number', value: Number(p) }; }
   if ((p[0] === '"' && p[p.length-1] === '"') || (p[0] === "'" && p[p.length-1] === "'")){
     this.next(); const str = p.slice(1, -1).replace(/\\n/g, '\n').replace(/\\r/g, '\r'); return { type:'string', value: str };
   }
-  if (/^[A-Za-z_]/.test(p)){
-    const id = this.next();
-    if (this.peek() === '('){
-      this.eat('(');
-      const args = [];
-      while (this.peek() !== ')' && this.peek() !== undefined){
-        if (this.peek() === ','){ this.next(); continue;}
-        args.push(this.parseExpression());
-      }
-      this.eat(')');
-      return { type:'call_expr', callee:id, args };
-    } else {
-      return { type:'ident', name:id };
-    }
-  }
-  // fallback
-  this.next();
-  return { type:'nil' };
+  if (/^[A-Za-z_]/.test(p)){ const id = this.next(); if (this.peek() === '('){ this.eat('('); const args = []; while (this.peek() !== ')' && this.peek() !== undefined){ if (this.peek() === ','){ this.next(); continue;} args.push(this.parseExpression()); } this.eat(')'); return { type:'call_expr', callee:id, args }; } else return { type:'ident', name:id }; }
+  this.next(); return { type:'nil' };
 };
 
-///// Bytecode builder
+///// Bytecode & builder (supports JMP/JZ for loops)
 const OPCODES = {
-  PUSHK: 1,
-  GETG: 2,
-  SETG: 3,
-  GETL: 4,
-  SETL: 5,
-  CALL: 6,
-  RETURN: 7,
-  ADD: 8,
-  SUB: 9,
-  MUL: 10,
-  DIV: 11,
-  CONCAT: 12,
-  JMP: 13,
-  JZ: 14,
-  CLOSE: 255
+  PUSHK: 1, GETG: 2, SETG: 3, GETL: 4, SETL: 5,
+  CALL: 6, RETURN: 7, ADD: 8, SUB: 9, MUL: 10, DIV: 11,
+  CONCAT: 12, JMP: 13, JZ: 14, CLOSE: 255
 };
 
 function BytecodeBuilder(){
-  this.consts = []; // array of constants
-  this.names = [];  // global names
-  this.code = [];   // number array: [op, arg1, arg2 ...]
-  this.localSlots = {}; // map function-scope locals to slot index
-  this.nextLocalSlot = 0;
+  this.consts = []; this.names = []; this.code = []; this.localSlots = {}; this.nextLocalSlot = 0;
 }
 BytecodeBuilder.prototype.addConst = function(v){
-  // naive add (allow duplicates for simplicity)
   const idx = this.consts.findIndex(x => x === v);
-  if (idx !== -1) return idx;
-  this.consts.push(v);
-  return this.consts.length - 1;
+  if (idx !== -1) return idx; this.consts.push(v); return this.consts.length - 1;
 };
 BytecodeBuilder.prototype.addName = function(n){
-  const idx = this.names.indexOf(n);
-  if (idx !== -1) return idx;
-  this.names.push(n);
-  return this.names.length - 1;
+  const idx = this.names.indexOf(n); if (idx !== -1) return idx; this.names.push(n); return this.names.length - 1;
 };
-BytecodeBuilder.prototype.emit = function(){
-  for (let i=0;i<arguments.length;i++) this.code.push(arguments[i]);
-};
-BytecodeBuilder.prototype.newLocal = function(name){
-  if (this.localSlots[name] !== undefined) return this.localSlots[name];
-  const slot = this.nextLocalSlot++;
-  this.localSlots[name] = slot;
-  return slot;
-};
+BytecodeBuilder.prototype.emit = function(){ for (let i=0;i<arguments.length;i++) this.code.push(arguments[i]); };
+BytecodeBuilder.prototype.newLocal = function(name){ if (this.localSlots[name] !== undefined) return this.localSlots[name]; const slot = this.nextLocalSlot++; this.localSlots[name] = slot; return slot; };
+
 BytecodeBuilder.prototype.buildFromAst = function(ast){
   if (!ast) return;
-  if (ast.type === 'chunk'){
-    for (const s of ast.body) this.buildFromAst(s);
-    this.emit(OPCODES.CLOSE);
-    return;
-  }
-  if (ast.type === 'local_assign'){
-    const slot = this.newLocal(ast.name);
-    this.buildExpr(ast.expr);
-    this.emit(OPCODES.SETL, slot);
-    return;
-  }
-  if (ast.type === 'assign'){
-    this.buildExpr(ast.expr);
-    const idx = this.addName(ast.name);
-    this.emit(OPCODES.SETG, idx);
-    return;
-  }
-  if (ast.type === 'call'){
-    const idx = this.addName(ast.callee);
-    this.emit(OPCODES.GETG, idx);
-    for (const a of ast.args) this.buildExpr(a);
-    this.emit(OPCODES.CALL, ast.args.length);
-    return;
-  }
-  if (ast.type === 'function'){
-    // build nested function as a constant that contains its own builder serialization
-    const child = new BytecodeBuilder();
-    // params occupy local slots 0..n-1
-    for (let i=0;i<ast.params.length;i++) child.localSlots[ast.params[i]] = i;
-    child.nextLocalSlot = ast.params.length;
-    for (const s of ast.body) child.buildFromAst(s);
-    child.emit(OPCODES.RETURN, 0);
-    child.emit(OPCODES.CLOSE);
-    const fnObj = { consts: child.consts, names: child.names, code: child.code };
-    const cidx = this.addConst(fnObj);
-    const nameIdx = this.addName(ast.name);
-    this.emit(OPCODES.PUSHK, cidx);
-    this.emit(OPCODES.SETG, nameIdx);
-    return;
-  }
-  if (ast.type === 'return'){
-    this.buildExpr(ast.expr);
-    this.emit(OPCODES.RETURN, 1);
-    return;
-  }
+  if (ast.type === 'chunk'){ for (const s of ast.body) this.buildFromAst(s); this.emit(OPCODES.CLOSE); return; }
+  if (ast.type === 'local_assign'){ const slot = this.newLocal(ast.name); this.buildExpr(ast.expr); this.emit(OPCODES.SETL, slot); return; }
+  if (ast.type === 'assign'){ this.buildExpr(ast.expr); const idx = this.addName(ast.name); this.emit(OPCODES.SETG, idx); return; }
+  if (ast.type === 'call'){ const idx = this.addName(ast.callee); this.emit(OPCODES.GETG, idx); for (const a of ast.args) this.buildExpr(a); this.emit(OPCODES.CALL, ast.args.length); return; }
+  if (ast.type === 'function'){ const child = new BytecodeBuilder(); for (let i=0;i<ast.params.length;i++) child.localSlots[ast.params[i]] = i; child.nextLocalSlot = ast.params.length; for (const s of ast.body) child.buildFromAst(s); child.emit(OPCODES.RETURN, 0); child.emit(OPCODES.CLOSE); const fnObj = { consts: child.consts, names: child.names, code: child.code }; const cidx = this.addConst(fnObj); const nameIdx = this.addName(ast.name); this.emit(OPCODES.PUSHK, cidx); this.emit(OPCODES.SETG, nameIdx); return; }
+  if (ast.type === 'return'){ this.buildExpr(ast.expr); this.emit(OPCODES.RETURN, 1); return; }
   if (ast.type === 'while'){
-    // compile: start -> cond ; JZ end ; body ; JMP start ; end:
     const startPos = this.code.length;
     this.buildExpr(ast.cond);
-    // placeholder for JZ (patch later)
+    // emit JZ with placeholder target (we'll record and patch)
     this.emit(OPCODES.JZ, 0);
-    const jzPos = this.code.length - 1;
+    const jzIndex = this.code.length - 1;
     for (const s of ast.body) this.buildFromAst(s);
     this.emit(OPCODES.JMP, startPos);
     const endPos = this.code.length;
-    // patch JZ target to endPos
-    this.code[jzPos] = OPCODES.JZ;
-    this.code[jzPos + 1] = endPos;
+    // patch target (write at jzIndex+1)
+    this.code[jzIndex + 1] = endPos;
     return;
   }
   if (ast.type === 'noop') return;
-  // fallback
 };
 
 BytecodeBuilder.prototype.buildExpr = function(expr){
   if (!expr) { this.emit(OPCODES.PUSHK, this.addConst(null)); return; }
-  if (expr.type === 'number'){
-    const idx = this.addConst(expr.value);
-    this.emit(OPCODES.PUSHK, idx); return;
-  }
-  if (expr.type === 'string'){
-    const idx = this.addConst(expr.value);
-    this.emit(OPCODES.PUSHK, idx); return;
-  }
-  if (expr.type === 'ident'){
-    if (expr.name in this.localSlots){
-      this.emit(OPCODES.GETL, this.localSlots[expr.name]); return;
-    } else {
-      const nidx = this.addName(expr.name);
-      this.emit(OPCODES.GETG, nidx); return;
-    }
-  }
-  if (expr.type === 'call_expr'){
-    if (expr.callee in this.localSlots){
-      this.emit(OPCODES.GETL, this.localSlots[expr.callee]);
-    } else {
-      this.emit(OPCODES.GETG, this.addName(expr.callee));
-    }
-    for (const a of expr.args) this.buildExpr(a);
-    this.emit(OPCODES.CALL, expr.args.length);
-    return;
-  }
-  if (expr.type === 'binop'){
-    this.buildExpr(expr.left);
-    this.buildExpr(expr.right);
-    if (expr.op === '+') this.emit(OPCODES.ADD);
-    else if (expr.op === '-') this.emit(OPCODES.SUB);
-    else if (expr.op === '*') this.emit(OPCODES.MUL);
-    else if (expr.op === '/') this.emit(OPCODES.DIV);
-    else if (expr.op === '..') this.emit(OPCODES.CONCAT);
-    else this.emit(OPCODES.ADD);
-    return;
-  }
+  if (expr.type === 'number'){ const idx = this.addConst(expr.value); this.emit(OPCODES.PUSHK, idx); return; }
+  if (expr.type === 'string'){ const idx = this.addConst(expr.value); this.emit(OPCODES.PUSHK, idx); return; }
+  if (expr.type === 'ident'){ if (expr.name in this.localSlots){ this.emit(OPCODES.GETL, this.localSlots[expr.name]); return; } else { const nidx = this.addName(expr.name); this.emit(OPCODES.GETG, nidx); return; } }
+  if (expr.type === 'call_expr'){ if (expr.callee in this.localSlots) this.emit(OPCODES.GETL, this.localSlots[expr.callee]); else this.emit(OPCODES.GETG, this.addName(expr.callee)); for (const a of expr.args) this.buildExpr(a); this.emit(OPCODES.CALL, expr.args.length); return; }
+  if (expr.type === 'binop'){ this.buildExpr(expr.left); this.buildExpr(expr.right); if (expr.op === '+') this.emit(OPCODES.ADD); else if (expr.op === '-') this.emit(OPCODES.SUB); else if (expr.op === '*') this.emit(OPCODES.MUL); else if (expr.op === '/') this.emit(OPCODES.DIV); else if (expr.op === '..') this.emit(OPCODES.CONCAT); else this.emit(OPCODES.ADD); return; }
   this.emit(OPCODES.PUSHK, this.addConst(null));
 };
 
-///// Serializer: produce a Lua table literal so loader can load it via load("return "..text)
 function serializeToLuaTable(builder){
   function litVal(v){
     if (v === null || v === undefined) return 'nil';
     if (typeof v === 'number') return String(v);
-    if (typeof v === 'string') {
-      return '"' + v.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n') + '"';
-    }
+    if (typeof v === 'string') return '"' + v.replace(/\\/g,'\\\\').replace(/"/g,'\\"').replace(/\n/g,'\\n') + '"';
     if (typeof v === 'object') {
       if (v.consts && v.names && v.code){
         return '{ consts = {' + v.consts.map(litVal).join(',') + '}, names = {' + v.names.map(s=> '"' + String(s).replace(/"/g,'\\"') + '"' ).join(',') + '}, code = {' + v.code.join(',') + '} }';
@@ -379,10 +209,11 @@ function serializeToLuaTable(builder){
   return '{ consts = {' + constsPart + '}, names = {' + namesPart + '}, code = {' + codePart + '} }';
 }
 
-///// Build Lua loader (interpreter) code (executor-friendly; uses load)
+// --- FIXED loader builder: uses bit32.bxor if present, otherwise pure-Lua fallback
 function buildLuaInterpreterPayload(base64Payload, xorKey){
+  // key and payload embedded
   const lua = `
--- VM loader generated
+-- VM loader (fixed XOR fallback)
 local payload_b64 = "${base64Payload}"
 local xor_key = ${xorKey}
 
@@ -404,17 +235,39 @@ local function b64dec(s)
   return table.concat(out)
 end
 
-local enc = b64dec(payload_b64)
-local bytes = {}
-for i=1,#enc do bytes[i] = string.byte(enc,i) ~ xor_key end
-local parts = {}
-for i=1,#bytes do parts[i] = string.char(bytes[i]) end
-local txt = table.concat(parts)
+-- portable XOR: use bit32.bxor if available, else fallback implementation
+local function bxor_fallback(a,b)
+  local res = 0
+  for i=0,7 do
+    local ab = math.floor(a / (2^i)) % 2
+    local bb = math.floor(b / (2^i)) % 2
+    if ab ~= bb then res = res + 2^i end
+  end
+  return res
+end
 
-local loader = load("return "..txt)
+local function xor_bytes_str(s, key)
+  local have_bit32 = (type(bit32) == 'table' and type(bit32.bxor) == 'function')
+  local out = {}
+  for i=1,#s do
+    local vb = string.byte(s, i)
+    local dec
+    if have_bit32 then dec = bit32.bxor(vb, key) else dec = bxor_fallback(vb, key) end
+    out[#out+1] = string.char(dec)
+  end
+  return table.concat(out)
+end
+
+-- decode payload
+local enc = b64dec(payload_b64)
+local txt = xor_bytes_str(enc, xor_key)
+
+-- loader: return the table literal produced during obfuscation
+local loader = load("return " .. txt)
 if not loader then error("vm: failed to load payload") end
 local prog = loader()
 
+-- interpreter opcodes mapping (same as builder)
 local OP = { PUSHK=1, GETG=2, SETG=3, GETL=4, SETL=5, CALL=6, RETURN=7, ADD=8, SUB=9, MUL=10, DIV=11, CONCAT=12, JMP=13, JZ=14, CLOSE=255 }
 
 local function run(prog)
@@ -453,9 +306,7 @@ local function run(prog)
       if type(fn) == 'function' then
         local ok, res = pcall(fn, table.unpack(args))
         if ok then push(res) else push(nil) end
-      else
-        push(nil)
-      end
+      else push(nil) end
     elseif op == OP.RETURN then
       local n = code[ip]; ip = ip + 1
       local out = {}
@@ -469,8 +320,7 @@ local function run(prog)
     elseif op == OP.JMP then local target = code[ip]; ip = target + 1
     elseif op == OP.JZ then local target = code[ip]; ip = ip + 1; local v = pop(); if not v then ip = target + 1 end
     elseif op == OP.CLOSE then break
-    else
-      error("vm: unknown opcode "..tostring(op))
+    else error("vm: unknown opcode "..tostring(op))
     end
   end
 end
@@ -480,41 +330,30 @@ run(prog)
   return lua;
 }
 
-///// High level obfuscate function
 function obfuscateLua(source, opts = {}){
   const target = opts.targetSizeBytes || DEFAULT_TARGET;
   const key = randint(XOR_KEY_MIN, XOR_KEY_MAX);
 
-  // tokenize and parse
   const tokens = tokenize(source);
   const p = new Parser(tokens);
   const ast = p.parseChunk();
 
-  // build bytecode
   const builder = new BytecodeBuilder();
   builder.buildFromAst(ast);
 
-  // serialize program to a Lua table literal string
   const tableLit = serializeToLuaTable(builder);
 
-  // XOR + base64 encode the table literal text
   const payloadBuf = Buffer.from(tableLit, 'utf8');
   const xored = xorBuffer(payloadBuf, key);
   const b64 = toBase64(xored);
 
-  // build lua interpreter payload (bootstrap that loads and runs)
   const luaLoader = buildLuaInterpreterPayload(b64, key);
 
-  // add junk until target size
-  let final = '-- OBFUSCATED VM PAYLOAD\n' + luaLoader;
+  let final = '-- OBFUSCATED VM PAYLOAD (fixed)\n' + luaLoader;
   while (Buffer.byteLength(final, 'utf8') < target){
     final += '\n-- ' + randName(8) + ' = "' + crypto.randomBytes(8).toString('hex') + '"\n';
   }
-  // trim to target (safe cut)
-  if (Buffer.byteLength(final, 'utf8') > target) {
-    final = final.slice(0, target);
-  }
-
+  if (Buffer.byteLength(final, 'utf8') > target) final = final.slice(0, target);
   return final;
 }
 
