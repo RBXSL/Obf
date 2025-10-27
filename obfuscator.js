@@ -1,10 +1,10 @@
 // obfuscator.js
-// Luau-friendly obfuscator with large junk/noise injection.
+// Robust Luau-friendly obfuscator with heavy junk/noise and parser-safe output.
 // - Encodes strings with single-byte XOR then base64
-// - Decoder uses bit32.bxor (Roblox/Luau compatible)
+// - Decoder prefers bit32.bxor but falls back to pure-Lua XOR implementation if needed
 // - Conservative identifier renaming
 // - Junk injection: many noop functions and huge unused strings (configurable)
-// - Preserves functionality; avoid loadstring or non-Luau-safe ops
+// - Wraps user code in `do ... end` to prevent ambiguous leading tokens
 
 const crypto = require('crypto');
 
@@ -39,7 +39,6 @@ function extractStrings(code) {
 }
 
 function encodeStringLiteral(inner) {
-  // inner: raw string content (not including surrounding quotes)
   const key = randint(1, 255);
   const buf = Buffer.from(inner, 'utf8');
   const out = Buffer.alloc(buf.length);
@@ -54,7 +53,6 @@ const LUA_KEYWORDS = new Set([
 
 // conservative identifier find (ignores strings)
 function findIdentifiers(code) {
-  // remove strings quickly
   const tmp = code.replace(STRING_RE, ' ');
   const ids = new Set();
   const re = /\b([A-Za-z_][A-Za-z0-9_]*)\b/g;
@@ -66,18 +64,18 @@ function findIdentifiers(code) {
   return Array.from(ids);
 }
 
-// build Luau-compatible decoder using bit32.bxor
+// build Luau-compatible decoder using bit32.bxor with a fallback
 function buildDecoderLua(encList) {
   const b64Array = encList.map(e => `"${e.b64.replace(/"/g, '\\"')}"`).join(', ');
   const keyArray  = encList.map(e => `${e.key}`).join(', ');
 
-  // This decoder uses bit32.bxor to XOR each byte with key (Luau/Roblox supports bit32).
-  // It uses only standard string and math functions available in Luau.
+  // Provide fallback XOR if bit32 not available
   const decoder = `
 -- runtime decoder injected by obfuscator (Luau-friendly)
 local __S = { ${b64Array} }
 local __K = { ${keyArray} }
 
+-- base64 decoder (minimal)
 local function __b64decode(s)
   local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
   s = string.gsub(s, '[^'..b..'=]', '')
@@ -93,6 +91,29 @@ local function __b64decode(s)
   end))
 end
 
+-- fallback xor for environments lacking bit32
+local function __bxor_fallback(a, b)
+  -- a and b are 0..255
+  local res = 0
+  for i = 0,7 do
+    local abit = math.floor(a / (2^i)) % 2
+    local bbit = math.floor(b / (2^i)) % 2
+    local rbit = (abit + bbit) % 2
+    res = res + rbit * (2^i)
+  end
+  return res
+end
+
+local __have_bit32 = (type(bit32) == "table" and type(bit32.bxor) == "function")
+
+local function __xor_byte(a, b)
+  if __have_bit32 then
+    return bit32.bxor(a, b)
+  else
+    return __bxor_fallback(a, b)
+  end
+end
+
 local function __decode(i)
   local b64 = __S[i]
   local key = __K[i]
@@ -100,8 +121,7 @@ local function __decode(i)
   local out = {}
   for j = 1, #raw do
     local vb = string.byte(raw, j)
-    -- using bit32.bxor for compatibility on Roblox/Luau
-    local dec = bit32.bxor(vb, key)
+    local dec = __xor_byte(vb, key)
     out[#out + 1] = string.char(dec)
   end
   return table.concat(out)
@@ -113,39 +133,40 @@ end
 
 // Generate junk/noop code: many functions and huge unused strings
 function generateJunk(countFuncs = 40, largeStrings = 3, stringSize = 20000) {
-  // countFuncs: number of noop functions
-  // largeStrings: number of long unused string variables to insert
-  // stringSize: approx characters per long string (keeps file big)
   let out = '\n-- junk section (noop functions and large unused strings)\n';
   for (let i = 0; i < countFuncs; i++) {
     const name = randId(10);
-    const a = randId(6), b = randId(6);
-    out += `local function ${name}(${a}, ${b})\n  local _x = ${a}\n  local _y = ${b}\n  if _x == _y then return _x else return (_x or _y) end\nend\n\n`;
+    const a = randId(6), b = randId(6), c = randId(6);
+    // produce slightly different noop bodies to avoid trivial dedupe
+    out += `local function ${name}(${a}, ${b}, ${c})\n  local _x = ${a} or ${b}\n  local _y = ${b} or ${c}\n  if _x == _y then return _x end\n  return (_y or _x)\nend\n\n`;
   }
-  // large unused strings (split to avoid interpreter line-size issues)
   for (let j = 0; j < largeStrings; j++) {
     const varName = randId(10);
-    // build the long string by concatenating many short random chunks
     const chunks = [];
-    const chunkCount = Math.max(1, Math.floor(stringSize / 128));
+    // create many small base64-derived chunks and concat them so it looks random but is safe
+    const chunkCount = Math.max(1, Math.floor(stringSize / 64));
     for (let k = 0; k < chunkCount; k++) {
-      // random 64-char chunk
       const chunk = crypto.randomBytes(48).toString('base64').replace(/[=+/]/g,'A').slice(0,64);
       chunks.push(`"${chunk}"`);
     }
     out += `local ${varName} = ${chunks.join(' .. ')}\n`;
-    // reference in a noop way so the interpreter can't easily optimize away (still unused)
     out += `local _unused_${j} = #${varName}\n\n`;
   }
   out += '-- end junk\n\n';
   return out;
 }
 
+// ensure safe separator between sections to avoid ambiguous tokens
+function safeSeparator() {
+  // a Lua semicolon is a statement separator — include it inside a comment so it is harmless
+  return '\n-- ;; separator\n';
+}
+
 // main obfuscator
 function obfuscateLua(code, opts = {}) {
-  const junkFuncs = opts.junkFunctions ?? 40;
-  const largeStrings = opts.largeStrings ?? 3;
-  const stringSize = opts.stringSize ?? 20000;
+  const junkFuncs = opts.junkFunctions ?? 80;
+  const largeStrings = opts.largeStrings ?? 6;
+  const stringSize = opts.stringSize ?? 60000;
 
   // 1) strip comments
   let c = stripComments(code);
@@ -168,12 +189,12 @@ function obfuscateLua(code, opts = {}) {
   // 4) replace placeholders with (__decode(i)) calls
   let replacedCode = replaced;
   for (let i = 0; i < encoders.length; i++) {
+    // put explicit parentheses to keep expression nature, but we'll wrap whole code in do..end later
     replacedCode = replacedCode.replace(new RegExp(`__STR_PLACEHOLDER_${i}__`, 'g'), `(__decode(${i+1}))`);
   }
 
   // 5) conservative renaming
   const ids = findIdentifiers(replacedCode);
-  // sort by length desc to avoid partial matches
   ids.sort((a, b) => b.length - a.length);
   const skipRegex = /^(?:_G|io|os|math|string|table|coroutine|package|debug|bit32)$/;
   const mapping = {};
@@ -183,7 +204,6 @@ function obfuscateLua(code, opts = {}) {
     if (/^\d+$/.test(id)) continue;
     mapping[id] = randId(6);
   }
-  // apply mapping (word boundaries)
   let renamed = replacedCode;
   for (const oldId of Object.keys(mapping)) {
     const newId = mapping[oldId];
@@ -196,12 +216,14 @@ function obfuscateLua(code, opts = {}) {
   renamed = renamed.replace(/\n{2,}/g, '\n');
   renamed = renamed.split('\n').map(l => l.trim()).join('\n');
 
-  // 7) build decoder and junk
+  // 7) build decoder and junk and wrap in a do-end block to avoid ambiguous leading tokens
   const decoder = buildDecoderLua(encoders);
   const junk = generateJunk(junkFuncs, largeStrings, stringSize);
 
-  // 8) concat final
-  const final = decoder + '\n' + junk + '\n' + renamed;
+  // use safe separators and wrap user code in a block
+  const final = decoder + safeSeparator() + junk + safeSeparator() + '\n-- user code block (wrapped)\n' +
+                'do\n' + renamed + '\nend\n';
+
   return final;
 }
 
