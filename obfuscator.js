@@ -1,18 +1,10 @@
 // obfuscator.js
-// Roblox Studio-friendly obfuscator
-// - No HttpService:Base64Decode
-// - Internal base64 decoder + xor fallback
-// - No loadstring (runs in Studio and most executors)
-// - Decoder present in file (obfuscated names + split pieces) but harder to read
-// - Targets ~100KB output (configurable)
-
-// NOTE: Full "perfect hiding" (decoder invisible) is impossible for Studio because Studio
-// disallows loadstring/load. If you run only in executors that provide loadstring, let me
-// know and I can produce a loadstring-hidden variant.
+// Executor-only obfuscator (hidden payload + loadstring).
+// Fixed bootstrap: globals for chunks, portable xor_byte, no '~' or '&'.
+// Use only in executors that allow loadstring/load (NOT Roblox Studio).
 
 const crypto = require('crypto');
-
-const TARGET_SIZE_BYTES_DEFAULT = 100 * 1024; // 100 KB
+const DEFAULT_TARGET_SIZE = 100 * 1024; // 100 KB
 
 function randId(len = 8) {
   const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
@@ -24,18 +16,14 @@ function randint(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+const STRING_RE = /(['"])(?:\\.|(?!\1).)*?\1/g;
 const LUA_KEYWORDS = new Set([
   "and","break","do","else","elseif","end","false","for","function","goto","if",
   "in","local","nil","not","or","repeat","return","then","true","until","while"
 ]);
 
-// ---- helpers ----
-const STRING_RE = /(['"])(?:\\.|(?!\1).)*?\1/g;
-
 function stripComments(code) {
-  code = code.replace(/--\[(=*)\[(?:[\s\S]*?)\]\1\]/g, '');
-  code = code.replace(/--[^\n\r]*/g, '');
-  return code;
+  return code.replace(/--\[(=*)\[(?:[\s\S]*?)\]\1\]/g, '').replace(/--[^\n\r]*/g, '');
 }
 
 function extractStrings(code) {
@@ -55,14 +43,6 @@ function encodeStringLiteral(inner) {
   return { key, b64: out.toString('base64') };
 }
 
-function replacePlaceholders(code, encoders) {
-  let replaced = code;
-  for (let i = 0; i < encoders.length; i++) {
-    replaced = replaced.replace(new RegExp(`__STR_PLACEHOLDER_${i}__`, 'g'), `(__decS(${i+1}))`);
-  }
-  return replaced;
-}
-
 function findIdentifiers(code) {
   const tmp = code.replace(STRING_RE, ' ');
   const ids = new Set();
@@ -75,59 +55,93 @@ function findIdentifiers(code) {
   return Array.from(ids);
 }
 
-// generate structural junk (complex-looking but inert)
+function renameIdentifiers(code) {
+  const ids = findIdentifiers(code);
+  ids.sort((a,b)=>b.length-a.length);
+  const skipRegex = /^(?:_G|io|os|math|string|table|coroutine|package|debug|bit32)$/;
+  const mapping = {};
+  for (const id of ids) {
+    if (LUA_KEYWORDS.has(id)) continue;
+    if (skipRegex.test(id)) continue;
+    if (/^\d+$/.test(id)) continue;
+    mapping[id] = randId(6);
+  }
+  let out = code;
+  for (const oldId of Object.keys(mapping)) out = out.replace(new RegExp(`\\b${oldId}\\b`, 'g'), mapping[oldId]);
+  return out;
+}
+
 function generateJunkApprox(targetBytes) {
-  let out = '\n-- junk start\n';
+  let out = '\n-- JUNK START\n';
   let approx = out.length;
-  const append = (s) => { out += s; approx += s.length; };
+  const append = s => { out += s; approx += s.length; };
 
   let i = 0;
-  while (approx < targetBytes * 0.65 && i < 300) {
+  while (approx < targetBytes * 0.55 && i < 400) {
     const f = randId(10);
     const a = randId(6), b = randId(6), c = randId(6);
-    append(`local function ${f}(${a},${b},${c}) local _x = ${a} or ${b} local _y = ${b} or ${c} if (_x == _y) then return _x end local _r = function() return _y end return _r() end\n`);
-    if (i % 3 === 0) {
+    append(`local function ${f}(${a},${b},${c}) local _x=(${a} or ${b}) local _y=(${b} or ${c}) if _x==_y then return _x end local _t = function() return _y end return _t() end\n`);
+    if (i % 4 === 0) {
       const t = randId(8);
       append(`local ${t}={}\nfor i=1,${randint(2,12)} do ${t}[i]="${crypto.randomBytes(6).toString('hex')}" end\n`);
     }
     i++;
   }
 
-  // padding with concatenated random chunks if needed
-  while (approx < targetBytes * 0.9) {
-    const name = randId(8);
+  while (approx < targetBytes * 0.85) {
+    const name = randId(9);
     const parts = [];
-    for (let k = 0; k < 12; k++) {
-      parts.push('"' + crypto.randomBytes(18).toString('base64').replace(/[=+/]/g, 'A').slice(0,24) + '"');
-    }
-    append(`local ${name} = ${parts.join(' .. ')}\nlocal _unused_${name} = #${name}\n`);
-    approx += 1000;
+    for (let k=0;k<8;k++) parts.push('"' + crypto.randomBytes(16).toString('base64').replace(/[=+/]/g,'A').slice(0,24) + '"');
+    append(`local ${name} = ${parts.join(' .. ')}\nlocal _unused_len_${name} = #${name}\n`);
+    approx += 800;
   }
 
-  append('-- junk end\n\n');
+  append('-- JUNK END\n\n');
   return out;
 }
 
-// Build an inline (but obfuscated) decoder section that does NOT use HttpService.
-// Names are intentionally mangled to make manual reading harder.
-function buildInlineDecoder(encoders) {
-  // encoders: [{key, b64}, ...]
-  // We'll build arrays __S and __K and small base64 decoder + xor fallback.
-  const sArray = encoders.map(e => `"${e.b64.replace(/"/g, '\\"')}"`).join(', ');
-  const kArray = encoders.map(e => `${e.key}`).join(', ');
+function xorAndBase64Encode(str, key) {
+  const buf = Buffer.from(str, 'utf8');
+  const out = Buffer.alloc(buf.length);
+  for (let i=0;i<buf.length;i++) out[i] = buf[i] ^ key;
+  return out.toString('base64');
+}
 
-  // Obfuscate function and variable names by randomizing them:
-  const name_s = randId(8);
-  const name_k = randId(8);
-  const fn_b64 = randId(8);
-  const fn_xor = randId(8);
-  const fn_bxor_fb = randId(8);
-  const fn_dec = randId(8);
+// Build bootstrap: define global chunk containers (_G["name"] = "..."), then assemble, decode, xor, run via loadstring
+function buildExecutorBootstrap(base64Payload, keyByte, opts) {
+  const chunkSize = opts.chunkSize || 800;
+  const chunks = [];
+  for (let i = 0; i < base64Payload.length; i += chunkSize) chunks.push(base64Payload.slice(i, i + chunkSize));
 
-  // Inline base64 decoder (compact)
-  const decoder = `
-local ${name_s} = { ${sArray} }
-local ${name_k} = { ${kArray} }
+  // create variable (global) names
+  const varNames = chunks.map(()=>randId(10));
+
+  // start building bootstrap
+  let out = '-- BOOTSTRAP START\n';
+
+  // assign global chunk variables (use _G["name"] to create global)
+  for (let i=0;i<varNames.length;i++) {
+    const v = varNames[i];
+    const chunk = chunks[i];
+    // split chunk into safe literal pieces
+    const pieces = [];
+    for (let j=0;j<chunk.length;j+=200) pieces.push('"' + chunk.slice(j, j+200).replace(/"/g,'\\"') + '"');
+    out += `_G["${v}"] = ${pieces.join(' .. ')}\n`;
+  }
+
+  // create order table (list of names in sequence)
+  const orderName = randId(8);
+  out += `local ${orderName} = { ${varNames.map(n => '"' + n + '"').join(', ')} }\n`;
+
+  // randomize helper names
+  const fn_b64 = randId(9);
+  const fn_xor = randId(9);
+  const fn_run = randId(9);
+  const keyName = randId(6);
+
+  // base64 decoder (compact) + portable xor_byte (bit32 or fallback)
+  out += `
+local ${keyName} = ${keyByte}
 
 local function ${fn_b64}(s)
   local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -147,111 +161,137 @@ local function ${fn_b64}(s)
   return table.concat(out)
 end
 
-local function ${fn_bxor_fb}(a,b)
-  local r = 0
-  for i = 0,7 do
+local function __bxor_fallback(a,b)
+  local res = 0
+  for i=0,7 do
     local ab = math.floor(a / (2^i)) % 2
     local bb = math.floor(b / (2^i)) % 2
-    local rb = (ab + bb) % 2
-    r = r + rb * (2^i)
+    if ab ~= bb then res = res + 2^i end
   end
-  return r
+  return res
 end
 
-local __have_bit32 = (type(bit32) == 'table' and type(bit32.bxor) == 'function')
-local function ${fn_xor}(a,b)
-  if __have_bit32 then return bit32.bxor(a,b) else return ${fn_bxor_fb}(a,b) end
-end
-
-local function ${fn_dec}(i)
-  local b64 = ${name_s}[i]
-  local key = ${name_k}[i]
-  local raw = ${fn_b64}(b64)
+local function ${fn_xor}(s, k)
+  local have_bit32 = (type(bit32) == 'table' and type(bit32.bxor) == 'function')
   local out = {}
-  for j = 1, #raw do
-    local v = string.byte(raw, j)
-    out[#out + 1] = string.char(${fn_xor}(v, key))
+  for i=1,#s do
+    local b = string.byte(s, i)
+    local x
+    if have_bit32 then
+      x = bit32.bxor(b, k)
+    else
+      x = __bxor_fallback(b, k)
+    end
+    out[#out+1] = string.char(x)
   end
   return table.concat(out)
 end
 
--- expose as short name to be used by replaced code:
-local __decS = ${fn_dec}
+-- assemble payload from global chunk variables in order
+local _payload_parts = {}
+for i=1,#${orderName} do
+  local vname = ${orderName}[i]
+  local val = _G[vname]
+  if val == nil then val = "" end
+  _payload_parts[#_payload_parts + 1] = val
+end
+local _b64 = table.concat(_payload_parts)
+local _decoded = ${fn_b64}(_b64)
+local _plain = ${fn_xor}(_decoded, ${keyName})
+
+local _loader = loadstring or load
+if _loader then
+  local f = _loader(_plain)
+  if type(f) == 'function' then
+    pcall(f)
+  end
+end
+
+-- BOOTSTRAP END
 `;
 
-  return decoder;
+  return out;
 }
 
-// Assemble final output with size control
-function obfuscateLua(input, options = {}) {
-  const target = options.targetSizeBytes || TARGET_SIZE_BYTES_DEFAULT;
+function obfuscateLua(inputCode, options = {}) {
+  const target = options.targetSizeBytes || DEFAULT_TARGET_SIZE;
+  const chunkSize = options.chunkSize || 800;
 
-  // 1) strip comments
-  let code = stripComments(input);
+  // 1) prepare user code
+  let code = stripComments(inputCode);
+  code = 'do\n' + code + '\nend\n';
 
-  // 2) extract strings
-  const { replaced, strings } = extractStrings(code);
+  // 2) small payload header (embedded inside hidden payload) to provide internal utilities (kept minimal)
+  const payloadHeader = `
+-- hidden payload header
+local function __internal_b64(s)
+  local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  s = string.gsub(s, '[^'..b..'=]','')
+  s = s:gsub('.', function(x)
+    if x == '=' then return '' end
+    local r,f='', (string.find(b,x)-1)
+    for i=6,0,-1 do r = r .. (math.floor(f/2^i) % 2) end
+    return r
+  end)
+  local out = {}
+  for chunk in s:gmatch('%d%d%d?%d?%d?%d?%d?%d') do
+    local c = 0
+    for i=1,8 do c = c*2 + (chunk:sub(i,i) == '1' and 1 or 0) end
+    out[#out+1] = string.char(c)
+  end
+  return table.concat(out)
+end
 
-  // 3) encode strings
-  const encoders = [];
-  for (let i = 0; i < strings.length; i++) {
-    let inner = strings[i].slice(1, -1);
-    inner = inner.replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t')
-                 .replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-    encoders.push(encodeStringLiteral(inner));
+local function __internal_xor(s,k)
+  local t = {}
+  for i=1,#s do
+    local b = string.byte(s,i)
+    -- prefer bit32 if available
+    if type(bit32) == 'table' and type(bit32.bxor) == 'function' then
+      t[#t+1] = string.char(bit32.bxor(b, k))
+    else
+      -- fallback
+      local res = 0
+      for ii = 0,7 do
+        local ab = math.floor(b / (2^ii)) % 2
+        local bb = math.floor(k / (2^ii)) % 2
+        if ab ~= bb then res = res + 2^ii end
+      end
+      t[#t+1] = string.char(res)
+    end
+  end
+  return table.concat(t)
+end
+`;
+
+  // 3) full hidden payload = header + user code
+  const fullHidden = payloadHeader + '\n' + code;
+
+  // 4) XOR+base64 encode hidden payload
+  const key = randint(1,255);
+  const b64Payload = xorAndBase64Encode(fullHidden, key);
+
+  // 5) outer junk (visible) to bloat file
+  let outerJunk = generateJunkApprox(target * 0.6);
+  if (outerJunk.length > target) outerJunk = outerJunk.slice(0, Math.floor(target * 0.6));
+
+  // 6) bootstrap that reconstructs hidden payload and runs via loadstring
+  const bootstrap = buildExecutorBootstrap(b64Payload, key, { chunkSize });
+
+  // 7) assemble final and pad to target
+  let final = '-- OBFUSCATED (executor-only)\n' + outerJunk + '\n' + bootstrap;
+  let iter = 0;
+  while (Buffer.byteLength(final, 'utf8') < target && iter < 6) {
+    final += '\n' + generateJunkApprox(Math.max(4*1024, target - Buffer.byteLength(final, 'utf8')));
+    iter++;
+  }
+  // safety trim (keep bootstrap present)
+  if (Buffer.byteLength(final, 'utf8') > target * 3) {
+    const splitPoint = final.indexOf('-- BOOTSTRAP START');
+    if (splitPoint > 0) final = final.slice(0, splitPoint) + final.slice(splitPoint);
   }
 
-  // 4) replace placeholders with __decS calls
-  let replacedCode = replacePlaceholders(replaced, encoders);
-
-  // 5) conservative identifier renaming
-  const ids = findIdentifiers(replacedCode);
-  ids.sort((a,b) => b.length - a.length);
-  const skipRegex = /^(?:_G|io|os|math|string|table|coroutine|package|debug|bit32)$/;
-  const mapping = {};
-  for (const id of ids) {
-    if (LUA_KEYWORDS.has(id)) continue;
-    if (skipRegex.test(id)) continue;
-    if (/^\d+$/.test(id)) continue;
-    mapping[id] = randId(6);
-  }
-  let renamed = replacedCode;
-  for (const oldId of Object.keys(mapping)) {
-    const newId = mapping[oldId];
-    renamed = renamed.replace(new RegExp(`\\b${oldId}\\b`, 'g'), newId);
-  }
-
-  // 6) light minify
-  renamed = renamed.replace(/[ \t]{2,}/g, ' ');
-  renamed = renamed.replace(/\r\n/g, '\n');
-  renamed = renamed.replace(/\n{2,}/g, '\n');
-  renamed = renamed.split('\n').map(l => l.trim()).join('\n');
-
-  // 7) build parts: decoder (inline, obfuscated names), junk, user code (wrapped)
-  const decoderInline = buildInlineDecoder(encoders);
-  const junk = generateJunkApprox(target);
-  const userBlock = 'do\n' + renamed + '\nend\n';
-
-  // Assemble and trim/pad to target by adjusting junk amount
-  let assembled = decoderInline + '\n' + junk + '\n' + userBlock;
-
-  // If too small, pad with extra junk strings; if too large, trim junk tail
-  const MAX_ITERS = 6;
-  let it = 0;
-  while (Buffer.byteLength(assembled, 'utf8') < target && it < MAX_ITERS) {
-    const add = generateJunkApprox(Math.max(8 * 1024, target - Buffer.byteLength(assembled, 'utf8')));
-    assembled = decoderInline + '\n' + add + '\n' + junk + '\n' + userBlock;
-    it++;
-  }
-
-  // Final safety: if overshot massively, trim the junk area (try to keep decoder+user intact)
-  if (Buffer.byteLength(assembled, 'utf8') > target * 3) {
-    // reduce junk by half
-    const smallerJunk = generateJunkApprox(Math.floor(target * 0.5));
-    assembled = decoderInline + '\n' + smallerJunk + '\n' + userBlock;
-  }
-
-  return assembled;
+  return final;
 }
 
 module.exports = { obfuscateLua };
