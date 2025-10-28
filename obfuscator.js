@@ -1,15 +1,8 @@
-// obfuscator.js
-// One-sided intimidating obfuscator for Luau (executor-first).
-// - XOR byte-array payload
-// - Single-line (no newlines) output for intimidation
-// - Randomized loader names, junk functions, dummy loops/conds
-// - Pads to ~100KB by default
-//
+// obfuscator.js (fixed: safe one-sided obfuscation, ensures separators)
 // Usage:
-// const fs = require('fs');
 // const { obfuscateLua } = require('./obfuscator');
-// const out = obfuscateLua('print("hello")', { targetSizeBytes: 100*1024 });
-// fs.writeFileSync('out_obf.lua', out, 'utf8');
+// const out = obfuscateLua('print("hello")', { targetSizeBytes: 120*1024 });
+// fs.writeFileSync('out_one_sided.lua', out, 'utf8');
 
 const crypto = require('crypto');
 
@@ -27,108 +20,116 @@ function randHex(len=8){ return crypto.randomBytes(len).toString('hex'); }
 function toByteArray(s){ const a = []; for (let i=0;i<s.length;i++) a.push(s.charCodeAt(i)); return a; }
 function xorArray(arr, key){ return arr.map(x => x ^ key); }
 
-function buildOneSidedLua(byteArr, key, opts){
-  const target = opts.targetSizeBytes || DEFAULT_TARGET;
+// --- Helpers to safely append fragments (always end with semicolon)
+function ensureTerminator(fragment){
+  if (!fragment) return ';';
+  fragment = String(fragment);
+  // Trim trailing whitespace
+  fragment = fragment.replace(/\s+$/g, '');
+  // If already ends with ; or newline or end-token like 'end' followed by ';', accept; else append ';'
+  if (/[;{}]$/.test(fragment)) return fragment;
+  // If ends with 'end' we still add semicolon (safe)
+  return fragment + ';';
+}
 
-  // Randomized internal names
-  const decodeFn = randId();
-  const bxorFn = randId();
-  const execFn = randId();
-  const dataVar = randId();
-  const tmpVar = randId();
-  const guardVar = randId();
+// --- Fake junk generator (nested dummy functions, assignments, loops) 
+function generateJunkSegment(){
+  let seg = '';
+  const pieces = randint(4,10);
+  for (let i=0;i<pieces;i++){
+    const name = randName(randint(4,8));
+    const val = randHex(randint(3,6));
+    seg += `${name}="${val}";`;
+  }
+  // add a few small dummy functions and loops
+  for (let j=0;j<randint(1,3);j++){
+    const fn = randId();
+    const vn = randName(6);
+    const vv = randHex(6);
+    seg += `function ${fn}() local ${vn}="${vv}"; for i=1,${randint(2,4)} do if false then ${vn}=${vn}..${vn} end end end;`;
+  }
+  return seg;
+}
 
-  // Small helper to generate "fake" nested functions & junk snippets
-  function fakeBlock(count){
-    let out = "";
-    for (let i=0;i<count;i++){
-      const fn = randId();
-      const a = randName(6);
-      const b = randHex(6);
-      // create a dummy function that is never called
-      out += `function ${fn}() local ${a}="${b}" for i=1,${randint(2,6)} do if i==${999999+i} then ${a}=${a}..${a} end end end`;
-    }
-    return out;
+// --- Build one-sided Lua safely from fragments
+function buildOneSidedLuaSafe(fragments, targetSize){
+  // Ensure each fragment ends with semicolon:
+  const safe = fragments.map(ensureTerminator);
+
+  // Join them into one string
+  let lua = safe.join('');
+
+  // Normalize CRLF to LF, then collapse all newlines into semicolons as defensive fallback
+  lua = lua.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n+/g, ';');
+
+  // Collapse repeated semicolons to a single semicolon
+  lua = lua.replace(/;{2,}/g, ';');
+
+  // Now pad with junk segments until we hit target size
+  while (Buffer.byteLength(lua, 'utf8') < targetSize){
+    lua += generateJunkSegment();
+    lua = lua.replace(/;{2,}/g, ';'); // keep it tidy
   }
 
-  // Build the core loader that decodes bytes and executes original code.
-  // Use bitwise fallback for XOR, try load then loadstring; executor-first.
-  // We'll keep the loader as minimal as possible but randomized variable/function names.
-  const dataArrayLiteral = byteArr.join(',');
+  // Trim exactly to target size (no newline left)
+  if (Buffer.byteLength(lua, 'utf8') > targetSize) lua = lua.slice(0, targetSize);
 
-  let lua = "";
+  // Remove newlines if any remain and collapse semicolons
+  lua = lua.replace(/\n/g, ';').replace(/;{2,}/g, ';');
 
-  // PROGRAM header: data array and key
-  lua += `${dataVar}={${dataArrayLiteral}}`;           // data var
-  lua += `${guardVar}=${key}`;                         // key var
-
-  // bxor fallback
-  lua += `local function ${bxorFn}(a,b) local r=0 for i=0,7 do local ab=math.floor(a/2^i)%2 local bb=math.floor(b/2^i)%2 if ab~=bb then r=r+2^i end end return r end`;
-
-  // decode function: builds the decoded string
-  lua += `local function ${decodeFn}()`; 
-  lua += `local _t={}`; 
-  lua += `for i=1,#${dataVar} do _t[i]=string.char(${bxorFn}(${dataVar}[i],${guardVar})) end`;
-  lua += `local s=table.concat(_t)`; 
-  lua += `return s end`;
-
-  // exec function: try load, loadstring, fallback pcall + load chunk prefix
-  lua += `local function ${execFn}(s)`;
-  lua += `local f = nil`;
-  lua += `if type(load)=='function' then f = load(s) end`;
-  lua += `if not f and type(loadstring)=='function' then f = loadstring(s) end`;
-  // if still no f, try wrapping as "return (function() ... end)()" to be safe (may not be necessary)
-  lua += `if not f then pcall(function() end) end`;
-  lua += `if f then local ok,err = pcall(f) if not ok then -- swallow errors to keep obfuscation stealth; optionally report\n end end`;
-  lua += `end`;
-
-  // Add fake nested junk, dummy loops/conds to confuse manual readers
-  lua += fakeBlock(6);
-  // Add a few dummy conditional chains and loops that are never true or never run
-  for (let i=0;i<8;i++){
-    const v1 = randName(6);
-    const v2 = randHex(4);
-    lua += `local ${v1}="${v2}"`;
-    lua += `if ${v1}==${v1}..'x' then for i=1,0 do ${v1}=${v1} end else if false then ${v1}=${v1} end end`;
-  }
-
-  // Run decode & exec
-  lua += `local ${tmpVar}=${decodeFn}()`;
-  lua += `${execFn}(${tmpVar})`;
-
-  // Add long one-sided junk lines (assignments + fake functions) to reach target size and intimidate
-  function junkLine(){
-    // create long repeated assignment-ish segment
-    let seg = "";
-    const parts = randint(6,14);
-    for (let i=0;i<parts;i++){
-      seg += `${randName(4)}="${randHex(6)}"`;
-    }
-    // add a tiny fake loop
-    seg += `function ${randId()}() for i=1,${randint(2,6)} do if i==${999999+randint(1,1000)} then return end end end`;
-    return seg;
-  }
-
-  while (Buffer.byteLength(lua,'utf8') < target){
-    lua += junkLine();
-  }
-
-  // Trim exactly to target size and remove newlines (one-sided)
-  if (Buffer.byteLength(lua,'utf8') > target) lua = lua.slice(0, target);
-  lua = lua.replace(/\n/g, ''); // ensure one-sided single-line
   return lua;
 }
 
-// Main exported function
+// --- Core one-sided obfuscator building the loader safely
+function buildOneSidedObfFromBytes(xoredBytes, key, targetSize){
+  // variable name randomization
+  const dataVar = randId();
+  const keyVar = randId();
+  const bxorFn = randId();
+  const decodeFn = randId();
+  const execFn = randId();
+  const tmpVar = randId();
+
+  // pieces array (we'll push fragments and then safely join)
+  const parts = [];
+
+  // data array (ensure semicolon after it)
+  parts.push(`${dataVar}={${xoredBytes.join(',')}}`); // ensureTerminator will add semicolon
+
+  // key
+  parts.push(`${keyVar}=${key}`);
+
+  // bxor fallback function
+  parts.push(`local function ${bxorFn}(a,b) local r=0 for i=0,7 do local ab=math.floor(a/2^i)%2 local bb=math.floor(b/2^i)%2 if ab~=bb then r=r+2^i end end return r end`);
+
+  // decode function (reconstruct string)
+  parts.push(`local function ${decodeFn}() local _t={} for i=1,#${dataVar} do _t[i]=string.char(${bxorFn}(${dataVar}[i],${keyVar})) end local s=table.concat(_t) return s end`);
+
+  // exec function (try load, then loadstring; if neither available, attempt to pcall nothing; swallow compile errors)
+  parts.push(`local function ${execFn}(s) local f=nil if type(load)=='function' then f=load(s) end if not f and type(loadstring)=='function' then f=loadstring(s) end if not f then return end local ok,err = pcall(f) if not ok then return end end`);
+
+  // small fake blocks to intimidate (non-functional)
+  for (let i=0;i<4;i++){
+    const fn = randId();
+    const name = randName(6);
+    parts.push(`function ${fn}() local ${name}="${randHex(6)}" for i=1,${randint(1,3)} do if false then ${name}=${name}..${name} end end end`);
+  }
+
+  // decode + exec invocation
+  parts.push(`local ${tmpVar}=${decodeFn}()`);
+  parts.push(`${execFn}(${tmpVar})`);
+
+  // convert parts to one-sided lua string safely
+  return buildOneSidedLuaSafe(parts, targetSize);
+}
+
+// --- Main export: obfuscateLua
 function obfuscateLua(source, opts = {}){
   const target = opts.targetSizeBytes || DEFAULT_TARGET;
-  // Choose a random XOR key
   const key = randint(1,255);
-  // Convert source to byte array and XOR with key
   const bytes = toByteArray(source);
   const xored = xorArray(bytes, key);
-  // Build one-sided Lua text
-  const lua = buildOneSidedLua(xored, key, { targetSizeBytes: target });
+  const lua = buildOneSidedObfFromBytes(xored, key, target);
   return lua;
 }
 
