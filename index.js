@@ -1,128 +1,49 @@
-// index.js
-const fs = require('fs');
+require('dotenv').config();
 const express = require('express');
-const bodyParser = require('body-parser');
-const { Client, IntentsBitField, Partials } = require('discord.js');
-const { obfuscateLua } = require('./obfuscator');
-
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-if (!DISCORD_TOKEN) {
-  console.error("Missing DISCORD_TOKEN env var");
-  process.exit(1);
-}
-
-// Bot config
-const MAX_INLINE = 1900; // characters; Discord codeblock limit safety
-const PORT = process.env.PORT || 3000;
-
-// Create discord client
-const client = new Client({
-  intents: [
-    IntentsBitField.Flags.Guilds,
-    IntentsBitField.Flags.GuildMessages,
-    IntentsBitField.Flags.MessageContent,
-    IntentsBitField.Flags.DirectMessages
-  ],
-  partials: [Partials.Channel]
-});
-
-client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-});
-
-// Simple text command: !obf with code block or .lua attachment in same message
-client.on('messageCreate', async (message) => {
-  try {
-    if (message.author.bot) return;
-    const content = message.content || '';
-
-    // Trigger only when message starts with !obf
-    if (!content.trim().startsWith('!obf')) return;
-
-    // Prefer attachments
-    if (message.attachments.size > 0) {
-      const att = message.attachments.first();
-      // fetch file by URL (Node 18+ provides global fetch)
-      try {
-        const res = await fetch(att.url);
-        const txt = await res.text();
-        const ob = obfuscateLua(txt);
-        await sendObfuscatedResult(message, ob);
-        return;
-      } catch (e) {
-        console.error('Attachment fetch error', e);
-        await message.reply('Failed to fetch attachment: ' + String(e).slice(0,200));
-        return;
-      }
-    }
-
-    // parse code block: ```lua\n...\n```
-    const m = content.match(/```(?:lua)?\n([\s\S]*?)```/);
-    if (m) {
-      const code = m[1];
-      const ob = obfuscateLua(code);
-      await sendObfuscatedResult(message, ob);
-      return;
-    }
-
-    // fallback: message body may be raw code (short)
-    if (content.trim().length > 5) {
-      // strip the command header
-      const after = content.replace(/^!obf\s*/i, '');
-      if (after.trim().length > 0) {
-        const ob = obfuscateLua(after);
-        await sendObfuscatedResult(message, ob);
-        return;
-      }
-    }
-
-    await message.reply('Usage: send `!obf` plus either a `.lua` attachment in the same message or include Lua in triple backticks (```lua\n...\n```).');
-
-  } catch (err) {
-    console.error('messageCreate error', err);
-    try { await message.reply('Obfuscation error: ' + String(err).slice(0,200)); } catch {}
-  }
-});
-
-async function sendObfuscatedResult(message, ob) {
-  try {
-    if (Buffer.byteLength(ob, 'utf8') > MAX_INLINE) {
-      // send as file
-      const buffer = Buffer.from(ob, 'utf8');
-      await message.reply({ content: 'Obfuscated result (file):', files: [{ attachment: buffer, name: 'obf.lua' }] });
-    } else {
-      await message.reply('```lua\n' + ob + '\n```');
-    }
-  } catch (e) {
-    console.error('sendObfuscatedResult error', e);
-    try { await message.reply('Failed to send result: ' + String(e).slice(0,200)); } catch {}
-  }
-}
-
-// Simple express server for /health and /api/obfuscate
+const crypto = require('crypto');
+const helmet = require('helmet');
 const app = express();
-app.use(bodyParser.json({ limit: '2mb' }));
 
-app.get('/health', (req, res) => res.send('ok'));
+app.use(helmet());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-app.post('/api/obfuscate', (req, res) => {
-  const { code } = req.body || {};
-  if (!code || typeof code !== 'string') return res.status(400).json({ error: 'missing code (string)' });
-  try {
-    const ob = obfuscateLua(code);
-    res.json({ result: ob });
-  } catch (e) {
-    console.error('api obfuscate error', e);
-    res.status(500).json({ error: String(e) });
+// Store tokens temporarily in memory (use Redis in production)
+const tokens = new Map(); // token => expiry timestamp
+
+// Generate random token
+function makeToken() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+// Example: generate new URL manually (for admin use)
+app.get('/generate', (req, res) => {
+  const token = makeToken();
+  const ttl = 60 * 2 * 1000; // 2 minutes
+  tokens.set(token, Date.now() + ttl);
+  const url = `${req.protocol}://${req.get('host')}/source?token=${token}`;
+  res.send(`✅ Token created (valid for 2 min)\n${url}`);
+});
+
+// Secure source delivery
+app.get('/source', (req, res) => {
+  const token = req.query.token;
+  const now = Date.now();
+  const exp = tokens.get(token);
+
+  if (!exp || now > exp) {
+    return res.status(403).send("Invalid or expired token");
   }
+
+  tokens.delete(token); // single-use
+  res.setHeader("Content-Type", "text/plain");
+  res.send(process.env.SECRET_CODE || "-- no code found --");
 });
 
-app.listen(PORT, () => {
-  console.log(`HTTP server listening on port ${PORT}`);
+// Health check
+app.get('/', (req, res) => {
+  res.send("Secure Lua Server running");
 });
 
-// Start Discord bot
-client.login(DISCORD_TOKEN).catch(err => {
-  console.error('Failed to login:', err);
-  process.exit(1);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Running on port " + PORT));
